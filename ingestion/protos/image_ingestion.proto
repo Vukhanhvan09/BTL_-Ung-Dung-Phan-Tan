@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package image_pipeline;
+
+service ImageIngestionService {
+  rpc UploadImage (ImageUploadRequest) returns (ImageUploadResponse);
+}
+
+message ImageUploadRequest {
+  string filename = 1;
+  bytes image_data = 2;
+  string source = 3;      // e.g. 'web', 'mobile', 'simulator'
+  string mime_type = 4;   // e.g. 'image/jpeg', 'image/png'
+  string camera_id = 5;   // The traffic camera ID
+  string capture_timestamp = 6; // ISO format capture time
+}
+
+message ImageUploadResponse {
+  string image_id = 1;
+  string s3_uri = 2;
+  string status = 3;
+  string message = 4;
+}
