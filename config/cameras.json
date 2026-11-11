@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "cameras": [
+    {
+      "camera_id": "CAM-HN-001",
+      "location": "Kim Ma - Nguyen Chi Thanh Intersection",
+      "latitude": 21.0294,
+      "longitude": 105.8112,
+      "traits": ["dense_moto", "urban"]
+    },
+    {
+      "camera_id": "CAM-HN-002",
+      "location": "Cau Giay Street (Near University of Transport and Communications)",
+      "latitude": 21.0264,
+      "longitude": 105.8023,
+      "traits": ["urban", "campus"]
+    },
+    {
+      "camera_id": "CAM-HN-003",
+      "location": "Tay Ho (Nhat Tan Bridge)",
+      "latitude": 21.0964,
+      "longitude": 105.8234,
+      "traits": ["bridge", "no_pedestrian", "heavy_truck"]
+    },
+    {
+      "camera_id": "CAM-HN-004",
+      "location": "Hoan Kiem Lake - Trang Tien",
+      "latitude": 21.0245,
+      "longitude": 105.8520,
+      "traits": ["tourist", "dense_pedestrian", "urban"]
+    },
+    {
+      "camera_id": "CAM-HN-005",
+      "location": "Long Bien Bridge Approach",
+      "latitude": 21.0430,
+      "longitude": 105.8600,
+      "traits": ["bridge", "heavy_truck", "no_pedestrian"]
+    },
+    {
+      "camera_id": "CAM-HN-006",
+      "location": "Pham Van Dong - Co Nhue Intersection",
+      "latitude": 21.0605,
+      "longitude": 105.7800,
+      "traits": ["highway", "dense_car"]
+    },
+    {
+      "camera_id": "CAM-HN-007",
+      "location": "Nguyen Trai - Thanh Xuan",
+      "latitude": 20.9955,
+      "longitude": 105.8095,
+      "traits": ["dense_moto", "urban"]
+    },
+    {
+      "camera_id": "CAM-HN-008",
+      "location": "Giai Phong - Dai La Intersection",
+      "latitude": 20.9990,
+      "longitude": 105.8410,
+      "traits": ["urban", "dense_car", "dense_moto"]
+    }
+  ]
+}

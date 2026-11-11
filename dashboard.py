@@ -144,7 +144,7 @@ def fetch_dashboard_data(detection_mode):
         cameras_df["latitude"] = cameras_df["latitude"].astype(float)
         cameras_df["longitude"] = cameras_df["longitude"].astype(float)
         
-        # 3. Traffic Summary Grouped
+        # 3. Traffic Summary — FINAL collapses retry duplicates
         traffic_summary = client.query_df("""
             SELECT
                 f.camera_id AS camera_id,
@@ -152,42 +152,69 @@ def fetch_dashboard_data(detection_mode):
                 v.vehicle_type_name AS vehicle_type_name,
                 sum(f.count) AS total_count,
                 avg(f.count) AS avg_count
-            FROM fact_traffic_flow f
+            FROM fact_traffic_flow AS f FINAL
             JOIN (SELECT * FROM dim_cameras FINAL) AS c ON f.camera_id = c.camera_id
             JOIN (SELECT * FROM dim_vehicles FINAL) AS v ON f.vehicle_type_id = v.vehicle_type_id
             WHERE f.detection_mode = {mode:String}
             GROUP BY f.camera_id, c.location, v.vehicle_type_name
         """, parameters={"mode": detection_mode})
 
-        # 4. Congestion Levels
+        # 4. Congestion — one row per event (not 5 vehicle rows)
         congestion_levels = client.query_df("""
             SELECT
                 camera_id,
                 congestion_level,
-                count(distinct event_id) AS frame_count
-            FROM fact_traffic_flow
-            WHERE detection_mode = {mode:String}
+                count() AS frame_count
+            FROM (
+                SELECT
+                    event_id,
+                    any(camera_id) AS camera_id,
+                    any(congestion_level) AS congestion_level
+                FROM fact_traffic_flow FINAL
+                WHERE detection_mode = {mode:String}
+                GROUP BY event_id
+            )
             GROUP BY camera_id, congestion_level
         """, parameters={"mode": detection_mode})
-        
-        # 5. Time series traffic flow
+
+        # 5. Time series — vehicle counts exclude pedestrians; inference per event
         time_series = client.query_df("""
             SELECT
-                f.timestamp AS timestamp,
-                f.camera_id AS camera_id,
-                c.location AS location,
-                sumIf(f.count, f.vehicle_type_id IN (1, 2, 3, 4)) AS total_vehicles,
-                avg(f.inference_time_ms) AS avg_inference
-            FROM fact_traffic_flow f
-            JOIN (SELECT * FROM dim_cameras FINAL) AS c
-                ON f.camera_id = c.camera_id
-            WHERE f.detection_mode = {mode:String}
-            GROUP BY f.timestamp, f.camera_id, c.location
-            ORDER BY f.timestamp ASC
+                timestamp,
+                camera_id,
+                location,
+                sum(vehicle_count) AS total_vehicles,
+                avg(inference_time_ms) AS avg_inference
+            FROM (
+                SELECT
+                    f.event_id AS event_id,
+                    any(f.timestamp) AS timestamp,
+                    any(f.camera_id) AS camera_id,
+                    any(c.location) AS location,
+                    sumIf(f.count, f.vehicle_type_id IN (1, 2, 3, 4)) AS vehicle_count,
+                    any(f.inference_time_ms) AS inference_time_ms
+                FROM fact_traffic_flow AS f FINAL
+                JOIN (SELECT * FROM dim_cameras FINAL) AS c
+                    ON f.camera_id = c.camera_id
+                WHERE f.detection_mode = {mode:String}
+                GROUP BY f.event_id
+            )
+            GROUP BY timestamp, camera_id, location
+            ORDER BY timestamp ASC
         """, parameters={"mode": detection_mode})
-        
-        # 6. Latest Images list (for details pane)
-        # captured_at = giờ chụp thật (cùng múi giờ với biểu đồ), thay cho uploaded_at (UTC)
+
+        # 6. KPI aggregates (accurate frame / vehicle / inference totals)
+        kpi_df = client.query_df("""
+            SELECT
+                uniqExact(camera_id) AS cameras_with_data,
+                uniqExact(event_id) AS processed_frames,
+                sumIf(count, vehicle_type_id IN (1, 2, 3, 4)) AS total_vehicles,
+                avgIf(inference_time_ms, vehicle_type_id = 1) AS avg_inference_ms
+            FROM fact_traffic_flow FINAL
+            WHERE detection_mode = {mode:String}
+        """, parameters={"mode": detection_mode})
+
+        # 7. Latest Images list
         images_df = client.query_df("""
             SELECT
                 img.image_id AS image_id,
@@ -197,10 +224,10 @@ def fetch_dashboard_data(detection_mode):
                 min(f.timestamp) AS captured_at,
                 f.camera_id AS camera_id,
                 c.location AS location,
-                f.congestion_level AS congestion_level,
+                any(f.congestion_level) AS congestion_level,
                 sumIf(f.count, f.vehicle_type_id IN (1, 2, 3, 4)) AS total_vehicles
             FROM (SELECT * FROM dim_images FINAL) AS img
-            JOIN fact_traffic_flow f
+            JOIN fact_traffic_flow AS f FINAL
                 ON img.image_id = f.image_id
             JOIN (SELECT * FROM dim_cameras FINAL) AS c
                 ON f.camera_id = c.camera_id
@@ -211,16 +238,22 @@ def fetch_dashboard_data(detection_mode):
                 img.s3_uri,
                 img.file_size_bytes,
                 f.camera_id,
-                c.location,
-                f.congestion_level
+                c.location
             ORDER BY captured_at DESC
         """, parameters={"mode": detection_mode})
-        
+
         client.close()
-        return cameras_df, traffic_summary, congestion_levels, time_series, images_df
+        return cameras_df, traffic_summary, congestion_levels, time_series, images_df, kpi_df
     except Exception as e:
         st.error(f"Failed to load data from ClickHouse: {e}")
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        return (
+            pd.DataFrame(),
+            pd.DataFrame(),
+            pd.DataFrame(),
+            pd.DataFrame(),
+            pd.DataFrame(),
+            pd.DataFrame(),
+        )
 
 # Main Layout
 st.markdown('<div class="main-header">🚦 Trung Tâm Giám Sát Giao Thông Thông Minh</div>', unsafe_allow_html=True)
@@ -228,19 +261,20 @@ st.markdown('<div class="subheader">Hệ thống phân tích lưu lượng xe th
 
 # Fetch Data
 mode_labels = {
-    "yolo": "YOLOv8 — nhận diện thật",
     "mock": "Mock — dữ liệu mô phỏng",
+    "yolo": "YOLOv8 — nhận diện thật",
     "unknown": "Dữ liệu cũ — chưa rõ chế độ",
 }
 
 detection_mode = st.sidebar.selectbox(
     "Nguồn kết quả nhận diện",
     list(mode_labels),
+    index=0,
     format_func=mode_labels.get,
 )
 
 st.caption(f"Đang hiển thị: {mode_labels[detection_mode]}")
-cameras_df, traffic_summary, congestion_levels, time_series, images_df = fetch_dashboard_data(detection_mode)
+cameras_df, traffic_summary, congestion_levels, time_series, images_df, kpi_df = fetch_dashboard_data(detection_mode)
 
 if cameras_df.empty or traffic_summary.empty:
     st.warning("⚠️ Cơ sở dữ liệu ClickHouse chưa có dữ liệu giao thông hoặc bảng trống!")
@@ -269,12 +303,19 @@ else:
         filtered_congestion = congestion_levels
         filtered_images = images_df
 
-    # --- KPI tính theo bộ lọc camera đang chọn ---
+    # --- KPI: camera filter uses filtered frames; all-cameras uses SQL aggregates ---
     vehicle_rows = filtered_summary[filtered_summary["vehicle_type_name"].isin(VEHICLE_TYPE_NAMES)]
-    kpi_cameras = filtered_summary["camera_id"].nunique()
-    kpi_frames = filtered_images["image_id"].nunique()
-    kpi_vehicles = int(vehicle_rows["total_count"].sum())
-    kpi_infer = round(float(filtered_ts["avg_inference"].mean()), 1) if not filtered_ts.empty else 0
+    if selected_camera == "Tất cả camera" and not kpi_df.empty:
+        kpi_cameras = int(kpi_df.iloc[0]["cameras_with_data"] or 0)
+        kpi_frames = int(kpi_df.iloc[0]["processed_frames"] or 0)
+        kpi_vehicles = int(kpi_df.iloc[0]["total_vehicles"] or 0)
+        kpi_infer = round(float(kpi_df.iloc[0]["avg_inference_ms"] or 0), 1)
+    else:
+        kpi_cameras = int(filtered_summary["camera_id"].nunique())
+        kpi_frames = int(filtered_images["image_id"].nunique())
+        kpi_vehicles = int(vehicle_rows["total_count"].sum()) if not vehicle_rows.empty else 0
+        # Weighted-ish: average of per-bucket averages only when one camera selected
+        kpi_infer = round(float(filtered_ts["avg_inference"].mean()), 1) if not filtered_ts.empty else 0.0
 
     # --- Top KPI Metrics ---
     col1, col2, col3, col4 = st.columns(4)
@@ -338,7 +379,7 @@ else:
                 )
                 fig_ts.update_xaxes(showgrid=True, gridcolor='#334155')
                 fig_ts.update_yaxes(showgrid=True, gridcolor='#334155')
-                st.plotly_chart(fig_ts, use_container_width=True)
+                st.plotly_chart(fig_ts, width="stretch")
             else:
                 st.info("Không có dữ liệu thời gian.")
 
@@ -367,7 +408,7 @@ else:
                     title_font_color='#38bdf8',
                     legend_title_text="Trạng thái"
                 )
-                st.plotly_chart(fig_pie, use_container_width=True)
+                st.plotly_chart(fig_pie, width="stretch")
             else:
                 st.info("Không có dữ liệu kẹt xe.")
 
@@ -379,12 +420,18 @@ else:
         with row2_col1:
             st.markdown("### 🚗 Tỷ Lệ Phương Tiện Theo Loại")
             if not filtered_summary.empty:
-                vehicle_agg = filtered_summary.groupby("vehicle_type_name")["total_count"].sum().reset_index()
+                # Align chart with KPI: vehicles only (exclude Pedestrian)
+                vehicle_agg = (
+                    filtered_summary[filtered_summary["vehicle_type_name"].isin(VEHICLE_TYPE_NAMES)]
+                    .groupby("vehicle_type_name")["total_count"]
+                    .sum()
+                    .reset_index()
+                )
                 fig_bar = px.bar(
                     vehicle_agg,
                     x="vehicle_type_name",
                     y="total_count",
-                    title="Tổng số lượng phương tiện theo chủng loại",
+                    title="Tổng số lượng phương tiện theo chủng loại (không gồm người đi bộ)",
                     labels={"vehicle_type_name": "Loại xe", "total_count": "Số lượng xe đếm được"},
                     color="vehicle_type_name",
                     color_discrete_sequence=px.colors.sequential.Blues
@@ -398,7 +445,7 @@ else:
                 )
                 fig_bar.update_xaxes(showgrid=False)
                 fig_bar.update_yaxes(showgrid=True, gridcolor='#334155')
-                st.plotly_chart(fig_bar, use_container_width=True)
+                st.plotly_chart(fig_bar, width="stretch")
             else:
                 st.info("Không có dữ liệu loại xe.")
                 
@@ -422,7 +469,7 @@ else:
                 )
                 fig_inf.update_xaxes(showgrid=True, gridcolor='#334155')
                 fig_inf.update_yaxes(showgrid=True, gridcolor='#334155')
-                st.plotly_chart(fig_inf, use_container_width=True)
+                st.plotly_chart(fig_inf, width="stretch")
             else:
                 st.info("Không có dữ liệu hiệu năng.")
 
@@ -443,7 +490,7 @@ else:
                     "latitude": "Vĩ Độ (Lat)",
                     "longitude": "Kinh Độ (Lng)"
                 }),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
         else:
@@ -478,7 +525,7 @@ else:
                 
                 with img_col:
                     if img_file:
-                        st.image(img_file, caption=f"Ảnh chụp camera thực tế từ {cam_id} ({loc}) vào {captured_at}", use_container_width=True)
+                        st.image(img_file, caption=f"Ảnh chụp camera thực tế từ {cam_id} ({loc}) vào {captured_at}", width="stretch")
                     else:
                         st.error("❌ Không thể lấy ảnh từ MinIO S3. Vui lòng kiểm tra kết nối tới container MinIO (localhost:9000).")
                         
@@ -502,7 +549,7 @@ else:
                         client = get_ch_client()
                         counts_df = client.query_df("""
                             SELECT v.vehicle_type_name as `Loại Xe`, f.count as `Số Lượng`
-                            FROM fact_traffic_flow f
+                            FROM fact_traffic_flow AS f FINAL
                             JOIN (SELECT * FROM dim_vehicles FINAL) AS v ON f.vehicle_type_id = v.vehicle_type_id
                             WHERE f.image_id = {image_id:String}
                               AND f.detection_mode = {mode:String}

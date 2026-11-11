@@ -39,12 +39,15 @@ except ImportError:
     logger.error("PySpark is not installed. Please install pyspark to run this script.")
     sys.exit(1)
 
-# The RabbitMQ connection/channel belong exclusively to this thread.
-# Spark may block for a long time on the main thread without starving heartbeats.
+# RabbitMQ connection/channel belong EXCLUSIVELY to this thread.
+# Never ACK/NACK from the Spark driver thread — wrong-channel ACKs cause redelivery.
 def rabbitmq_consumer(inbox, commands, replies):
     import pika
+    import threading
 
+    consumer_thread_id = threading.get_ident()
     connection = None
+    channel = None
     delivered = False
     try:
         credentials = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASS)
@@ -82,7 +85,7 @@ def rabbitmq_consumer(inbox, commands, replies):
         if not events:
             return
 
-        # All Pika calls occur here, including heartbeat service and ACK.
+        # All Pika calls (heartbeat + ACK) stay on THIS channel/thread only.
         while True:
             connection.process_data_events(time_limit=1)
             try:
@@ -92,23 +95,25 @@ def rabbitmq_consumer(inbox, commands, replies):
             if isinstance(command, tuple) and command[0] == "COMPLETE":
                 _, failures = command
 
+                if threading.get_ident() != consumer_thread_id:
+                    raise RuntimeError("ACK attempted outside RabbitMQ consumer thread")
+                if channel is None or not channel.is_open:
+                    raise RuntimeError("RabbitMQ channel closed before ACK")
+
                 for tag, event_id, body, properties in deliveries:
                     if event_id in failures:
                         headers = dict(properties.headers or {})
                         attempt = int(headers.get("x-processing-attempt", 0)) + 1
 
                         headers["x-processing-attempt"] = attempt
-                        headers["x-last-error"] = failures[event_id]
+                        headers["x-last-error"] = str(failures[event_id])[:500]
 
-                        # Anh khong ton tai: chuyen thang vao DLQ
-                        is_missing_image = "NoSuchKey" in failures[event_id]
-
-                        # Loi tam thoi: retry toi da 3 lan
+                        is_missing_image = "NoSuchKey" in str(failures[event_id])
                         target_queue = (
-                        DLQ_NAME
-                        if is_missing_image or attempt >= 3
-                        else QUEUE_NAME
-                    )
+                            DLQ_NAME
+                            if is_missing_image or attempt >= 3
+                            else QUEUE_NAME
+                        )
                         channel.basic_publish(
                             exchange="",
                             routing_key=target_queue,
@@ -126,6 +131,7 @@ def rabbitmq_consumer(inbox, commands, replies):
                             event_id, attempt, target_queue,
                         )
 
+                    # ACK only on the same channel that consumed the message
                     channel.basic_ack(delivery_tag=tag, multiple=False)
 
                 connection.process_data_events(time_limit=0)
@@ -165,8 +171,9 @@ def process_partition(iterator, detection_mode):
     runs YOLOv8 object detection (or mock detection), and yields metrics.
     """
     import io
+    import sys as _sys
     from minio.error import S3Error
-    
+
     # Initialize MinIO client inside worker partition
     try:
         # pyrefly: ignore [missing-import]
@@ -180,6 +187,11 @@ def process_partition(iterator, detection_mode):
     except ImportError:
         logger.error("minio library missing on worker node.")
         raise
+
+    job_dir = "/opt/spark-jobs"
+    if job_dir not in _sys.path:
+        _sys.path.insert(0, job_dir)
+    from camera_traits import apply_camera_traits
 
     if detection_mode == "yolo":
         model_path = Path("/opt/spark-jobs/weights/yolov8n.pt")
@@ -203,17 +215,9 @@ def process_partition(iterator, detection_mode):
         # row: (event_id, image_id, bucket, s3_key, uploaded_at, filename, camera_id, capture_timestamp)
         event_id, image_id, bucket, s3_key, uploaded_at, filename, camera_id, capture_timestamp = row
         start_time = time.time()
-        
-        vehicle_counts = {
-            'Car': 0,
-            'Motorcycle': 0,
-            'Bus': 0,
-            'Truck': 0,
-            'Pedestrian': 0
-        }
 
         try:
-            # 1. Fetch image from MinIO
+            # 1. Fetch image from MinIO — never emit zero-count success on fetch/decode errors
             response = None
             try:
                 response = minio_client.get_object(bucket, s3_key)
@@ -230,12 +234,30 @@ def process_partition(iterator, detection_mode):
                     finally:
                         response.release_conn()
 
+            # Validate image bytes before any detection path
+            from PIL import Image as PILImage
+            try:
+                with PILImage.open(io.BytesIO(img_data)) as probe:
+                    probe.verify()
+                img = PILImage.open(io.BytesIO(img_data))
+            except Exception as decode_err:
+                reason = f"InvalidImage: {decode_err}"
+                logger.warning("Bad image for event %s: %s", event_id, reason)
+                yield event_id, [], reason
+                continue
+
+            vehicle_counts = {
+                'Car': 0,
+                'Motorcycle': 0,
+                'Bus': 0,
+                'Truck': 0,
+                'Pedestrian': 0
+            }
+
             if detection_mode == "yolo":
                 # 2. Run real YOLOv8 object detection
-                img_io = io.BytesIO(img_data)
-                img = Image.open(img_io)
                 results = model(img)
-                
+
                 # YOLO COCO class indices:
                 # 0: person (Pedestrian)
                 # 2: car (Car)
@@ -262,7 +284,7 @@ def process_partition(iterator, detection_mode):
                     hour = dt.hour
                 except Exception:
                     hour = 12  # default to noon
-                
+
                 is_peak = (7 <= hour <= 9) or (17 <= hour <= 19)
                 is_night = (hour >= 22) or (hour <= 5)
 
@@ -291,29 +313,27 @@ def process_partition(iterator, detection_mode):
                         'Pedestrian': random.randint(2, 6)
                     }
 
-                # Camera-specific modifers
-                if camera_id == 'CAM-HN-003':  # Nhat Tan Bridge
-                    vehicle_counts['Pedestrian'] = 0
-                    vehicle_counts['Car'] = int(vehicle_counts['Car'] * 1.5)
-                    vehicle_counts['Truck'] = int(vehicle_counts['Truck'] * 1.5)
-                elif camera_id == 'CAM-HN-001': # Kim Ma
-                    vehicle_counts['Motorcycle'] = int(vehicle_counts['Motorcycle'] * 1.3)
-                    vehicle_counts['Truck'] = max(0, vehicle_counts['Truck'] - 1)
+                vehicle_counts = apply_camera_traits(vehicle_counts, camera_id)
 
         except S3Error as exc:
             if exc.code != "NoSuchKey":
-                raise
+                reason = f"MinIO {exc.code}: {bucket}/{s3_key}"
+                logger.warning("MinIO error for event %s: %s", event_id, reason)
+                yield event_id, [], reason
+                continue
 
             reason = f"MinIO {exc.code}: {bucket}/{s3_key}"
             logger.warning("Image missing for event %s: %s", event_id, reason)
             yield event_id, [], reason
             continue
-        except Exception:
+        except Exception as exc:
+            reason = f"ProcessingError: {exc}"
             logger.exception("Error processing image %s", image_id)
-            raise
+            yield event_id, [], reason
+            continue
 
         inference_time_ms = int((time.time() - start_time) * 1000)
-        
+
         # Determine congestion level
         total_vehicles = sum(vehicle_counts.values())
         if total_vehicles >= 45:
@@ -392,7 +412,7 @@ def save_to_clickhouse(events, traffic_results, detection_mode):
         existing_facts_result = client.query(
             """
             SELECT DISTINCT event_id, vehicle_type_id, detection_mode
-            FROM fact_traffic_flow
+            FROM fact_traffic_flow FINAL
             WHERE event_id IN {ids:Array(String)}
             """,
             parameters={"ids": event_ids}
@@ -450,6 +470,7 @@ def save_to_clickhouse(events, traffic_results, detection_mode):
             if key in seen_keys:
                 continue
 
+            now_ts = datetime.utcnow()
             fact_traffic_data.append((
                 result[0],
                 datetime.fromisoformat(result[1]),
@@ -459,8 +480,9 @@ def save_to_clickhouse(events, traffic_results, detection_mode):
                 result[5],
                 result[6],
                 int(result[7]),
-                detection_mode
-))
+                detection_mode,
+                now_ts,
+            ))
 
             seen_keys.add(key)
 
@@ -479,7 +501,7 @@ def save_to_clickhouse(events, traffic_results, detection_mode):
                 ]
             )
 
-        # 6. Insert missing traffic records
+        # 6. Insert missing traffic records (ReplacingMergeTree dedups by ORDER BY key)
         if fact_traffic_data:
             client.insert(
                 "fact_traffic_flow",
@@ -493,11 +515,12 @@ def save_to_clickhouse(events, traffic_results, detection_mode):
                     "congestion_level",
                     "image_id",
                     "inference_time_ms",
-                    "detection_mode"
+                    "detection_mode",
+                    "inserted_at",
                 ]
             )
 
-        # 7. Verify all event/vehicle keys exist
+        # 7. Verify all event/vehicle keys exist (FINAL collapses duplicates)
         expected_keys = {
             (event["event_id"], vehicle_type_id)
             for event in events
@@ -507,11 +530,12 @@ def save_to_clickhouse(events, traffic_results, detection_mode):
         verification_result = client.query(
             """
             SELECT event_id, vehicle_type_id
-            FROM fact_traffic_flow
+            FROM fact_traffic_flow FINAL
             WHERE event_id IN {ids:Array(String)}
+              AND detection_mode = {mode:String}
             GROUP BY event_id, vehicle_type_id
             """,
-            parameters={"ids": event_ids}
+            parameters={"ids": event_ids, "mode": detection_mode}
         )
 
         verified_keys = {
@@ -558,7 +582,7 @@ def get_completed_event_ids(event_ids):
         result = client.query(
             """
             SELECT event_id
-            FROM fact_traffic_flow
+            FROM fact_traffic_flow FINAL
             WHERE event_id IN {ids:Array(String)}
             GROUP BY event_id
             HAVING uniqExact(vehicle_type_id) = 5
@@ -619,17 +643,22 @@ def main():
 
         failures = {}
         if pending:
+            spark_master = os.getenv(
+                "SPARK_MASTER_URL",
+                "spark://spark-master:7077"
+            ).strip()
+            if not spark_master or spark_master.startswith("local"):
+                raise RuntimeError(
+                    f"Refuse local Spark master {spark_master!r}; "
+                    "use cluster URL spark://spark-master:7077"
+                )
             spark = (
                 SparkSession.builder
                 .appName("Distributed-Traffic-YOLO-Detection")
-                .master(
-                    os.getenv(
-                        "SPARK_MASTER_URL",
-                        "spark://spark-master:7077"
-                    )
-                )
+                .master(spark_master)
                 .getOrCreate()
             )
+            logger.info("Spark cluster master: %s", spark_master)
             spark_input_data = [
                 (e["event_id"], e["image_id"], e["bucket"], e["s3_key"],
                  e["uploaded_at"], e["filename"],
@@ -637,8 +666,11 @@ def main():
                  e.get("capture_timestamp", e["uploaded_at"]))
                 for e in pending
             ]
+            # Spread work across N Spark workers (at least 2, up to pending size / 2)
+            num_slices = max(2, min(len(spark_input_data), int(os.getenv("SPARK_JOB_PARTITIONS", "6"))))
+            logger.info("Parallelizing %d events into %d partitions", len(spark_input_data), num_slices)
             outcomes = (
-                spark.sparkContext.parallelize(spark_input_data)
+                spark.sparkContext.parallelize(spark_input_data, num_slices)
                 .mapPartitions(
                     partial(process_partition, detection_mode=detection_mode)
                 )

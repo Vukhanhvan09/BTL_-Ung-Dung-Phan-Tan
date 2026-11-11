@@ -2,8 +2,9 @@
 services:
   # --- Message Broker ---
   rabbitmq:
-    image: rabbitmq:3-management-alpine
+    image: rabbitmq:3.13-management-alpine
     container_name: image_pipeline_rabbitmq
+    restart: unless-stopped
     ports:
       - "5672:5672"
       - "15672:15672"
@@ -11,15 +12,17 @@ services:
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "check_running"]
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
       interval: 10s
-      timeout: 5s
-      retries: 5
+      timeout: 8s
+      retries: 10
+      start_period: 20s
 
   # --- Object Storage (Data Lake) ---
   minio:
     image: cgr.dev/chainguard/minio:latest
     container_name: image_pipeline_minio
+    restart: unless-stopped
     ports:
       - "9000:9000"
       - "9001:9001"
@@ -29,11 +32,19 @@ services:
     command: server /data --console-address ":9001"
     volumes:
       - minio_data:/data
+    # Chainguard image is minimal (no curl); rely on TCP readiness via start scripts
+    healthcheck:
+      test: ["CMD-SHELL", "minioc --help >/dev/null 2>&1 || minio --help >/dev/null 2>&1 || exit 0"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   # --- Data Warehouse ---
   clickhouse:
-    image: clickhouse/clickhouse-server:latest
+    image: clickhouse/clickhouse-server:24.8
     container_name: image_pipeline_clickhouse
+    restart: unless-stopped
     ports:
       - "8123:8123"
       - "9009:9000"
@@ -41,17 +52,20 @@ services:
       - CLICKHOUSE_DB=traffic_dw
       - CLICKHOUSE_USER=default
       - CLICKHOUSE_PASSWORD=traffic_password
+      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
     ulimits:
       nofile:
         soft: 262144
         hard: 262144
     volumes:
-      - ./clickhouse/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+      - ./clickhouse/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+      - clickhouse_data:/var/lib/clickhouse
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:8123/ping || exit 1"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 12
+      start_period: 25s
 
   # --- Apache Spark Cluster ---
   spark-master:
@@ -60,6 +74,14 @@ services:
       dockerfile: spark/Dockerfile
     image: traffic-spark:3.4.1
     container_name: image_pipeline_spark_master
+    restart: unless-stopped
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
     environment:
       - DETECTION_MODE=${DETECTION_MODE:?Set DETECTION_MODE to mock or yolo}
       - SPARK_MODE=master
@@ -67,6 +89,9 @@ services:
       - SPARK_MASTER_URL=spark://spark-master:7077
       - RABBITMQ_HOST=rabbitmq
       - RABBITMQ_PORT=5672
+      - RABBITMQ_USER=guest
+      - RABBITMQ_PASS=guest
+      - RABBITMQ_QUEUE=image_processing_queue
       - MINIO_ENDPOINT=minio:9000
       - MINIO_ACCESS_KEY=minioadmin
       - MINIO_SECRET_KEY=minioadmin
@@ -77,20 +102,35 @@ services:
       - CLICKHOUSE_PASSWORD=traffic_password
     ports:
       - "7077:7077"
-      - "8080:8080"
+      - "8082:8080"
     volumes:
       - ./spark:/opt/spark-jobs
+      - ./config:/opt/config:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "/opt/bitnami/python/bin/python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/', timeout=5)\"",
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      start_period: 45s
 
+  # Scale with: docker compose up -d --scale spark-worker=${SPARK_WORKER_REPLICAS:-3}
+  # (no fixed container_name so N workers can join the same Spark master)
   spark-worker:
     image: traffic-spark:3.4.1
-    container_name: image_pipeline_spark_worker
+    restart: unless-stopped
     depends_on:
-      - spark-master
+      spark-master:
+        condition: service_healthy
     environment:
+      - DETECTION_MODE=${DETECTION_MODE:?Set DETECTION_MODE to mock or yolo}
       - SPARK_MODE=worker
       - SPARK_MASTER_URL=spark://spark-master:7077
-      - SPARK_WORKER_CORES=2
-      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=${SPARK_WORKER_CORES:-2}
+      - SPARK_WORKER_MEMORY=${SPARK_WORKER_MEMORY:-2G}
       - SPARK_RPC_AUTHENTICATION_ENABLED=no
       - RABBITMQ_HOST=rabbitmq
       - RABBITMQ_PORT=5672
@@ -102,33 +142,43 @@ services:
       - CLICKHOUSE_DB=traffic_dw
       - CLICKHOUSE_USER=default
       - CLICKHOUSE_PASSWORD=traffic_password
-    ports:
-      - "8081:8081"
+    # Worker UI ports are internal; avoid host port conflicts when scaling to N
+    expose:
+      - "8081"
     volumes:
       - ./spark:/opt/spark-jobs
+      - ./config:/opt/config:ro
+    # Local Compose scaling (not Swarm):
+    #   docker compose up -d --scale spark-worker=${SPARK_WORKER_REPLICAS:-3}
 
   # --- Postgres for Airflow Metadata ---
   airflow-db:
     image: postgres:13-alpine
     container_name: image_pipeline_airflow_db
+    restart: unless-stopped
     environment:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
       POSTGRES_DB: airflow
     ports:
       - "5432:5432"
+    volumes:
+      - airflow_db_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U airflow"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 10s
 
   # --- Apache Airflow Initialization ---
   airflow-init:
     image: apache/airflow:2.6.3-python3.9
     container_name: image_pipeline_airflow_init
+    restart: "no"
     depends_on:
-      - airflow-db
+      airflow-db:
+        condition: service_healthy
     environment:
       - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@airflow-db/airflow
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
@@ -143,15 +193,18 @@ services:
           --lastname User \
           --role Admin \
           --email admin@example.com \
-          --password admin
+          --password admin || true
 
   # --- Apache Airflow Webserver ---
   airflow-webserver:
     image: apache/airflow:2.6.3-python3.9
     container_name: image_pipeline_airflow_webserver
+    restart: unless-stopped
     depends_on:
       airflow-db:
         condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
     environment:
       - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@airflow-db/airflow
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
@@ -164,9 +217,10 @@ services:
     command: webserver
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      interval: 15s
+      timeout: 8s
+      retries: 12
+      start_period: 40s
 
   # --- Apache Airflow Scheduler ---
   airflow-scheduler:
@@ -175,8 +229,19 @@ services:
       dockerfile: airflow/Dockerfile
     image: traffic-airflow:2.6.3
     container_name: image_pipeline_airflow_scheduler
+    restart: unless-stopped
     depends_on:
       airflow-db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+      spark-master:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      clickhouse:
         condition: service_healthy
     environment:
       - DETECTION_MODE=${DETECTION_MODE:?Set DETECTION_MODE to mock or yolo}
@@ -184,6 +249,9 @@ services:
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
       - AIRFLOW__CORE__LOAD_EXAMPLES=False
       - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_TOTAL_EXECUTOR_CORES=${SPARK_TOTAL_EXECUTOR_CORES:-6}
+      - SPARK_EXECUTOR_CORES=${SPARK_WORKER_CORES:-2}
+      - SPARK_EXECUTOR_MEMORY=${SPARK_WORKER_MEMORY:-2G}
       - MINIO_ENDPOINT=minio:9000
       - MINIO_ACCESS_KEY=minioadmin
       - MINIO_SECRET_KEY=minioadmin
@@ -199,7 +267,10 @@ services:
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - ./spark:/opt/spark-jobs
+      - ./config:/opt/config:ro
     command: scheduler
 
 volumes:
   minio_data:
+  clickhouse_data:
+  airflow_db_data:

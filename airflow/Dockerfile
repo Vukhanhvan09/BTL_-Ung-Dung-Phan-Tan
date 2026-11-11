@@ -24,10 +24,12 @@ RUN uv python install 3.11 \
     && uv pip install \
        --python /home/airflow/spark-venv/bin/python \
        "pyspark==3.4.1" \
-       "pika>=1.3,<2" \
-       "minio>=7.2,<8" \
-       "clickhouse-connect>=0.7,<1" \
-       "Pillow>=10,<12"
+       "pika>=1.3.1,<2" \
+       "minio>=7.2.0,<8" \
+       "clickhouse-connect>=0.7.0,<1" \
+       "Pillow>=10.0.0,<12" \
+       "numpy>=1.24.0,<2" \
+       "protobuf>=4.21.0,<6"
 
 ENV SPARK_HOME=/home/airflow/spark-venv/lib/python3.11/site-packages/pyspark
 ENV PYSPARK_DRIVER_PYTHON=/home/airflow/spark-venv/bin/python

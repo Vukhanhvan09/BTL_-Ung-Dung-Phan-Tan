@@ -110,23 +110,30 @@ class ImageIngestionService(image_ingestion_pb2_grpc.ImageIngestionServiceServic
             raise e
 
     def _publish_event(self, payload, retries=3):
+        """Publish with publisher confirms. Raises if broker does not confirm."""
         last_err = None
         for attempt in range(1, retries + 1):
             try:
                 with pika.BlockingConnection(self.rabbitmq_params) as connection:
                     channel = connection.channel()
-                    channel.confirm_delivery()  # broker xác nhận đã nhận tin
-                    channel.basic_publish(
+                    channel.queue_declare(queue=QUEUE_NAME, durable=True)
+                    channel.confirm_delivery()
+                    confirmed = channel.basic_publish(
                         exchange="",
                         routing_key=QUEUE_NAME,
                         body=json.dumps(payload),
                         properties=pika.BasicProperties(
-                            delivery_mode=2,  # tin nhắn bền vững
+                            delivery_mode=2,
                             content_type="application/json",
                             message_id=payload["event_id"],
                         ),
                         mandatory=True,
                     )
+                    # pika confirm_delivery: False means unroutable / not confirmed
+                    if confirmed is False:
+                        raise pika.exceptions.UnroutableError(
+                            "RabbitMQ did not confirm message delivery"
+                        )
                 return
             except Exception as e:
                 last_err = e
@@ -134,6 +141,15 @@ class ImageIngestionService(image_ingestion_pb2_grpc.ImageIngestionServiceServic
                 time.sleep(0.5 * attempt)
         raise last_err
 
+    def _rollback_minio_object(self, s3_key):
+        """Remove orphan object so MinIO stays consistent with the queue."""
+        try:
+            self.minio_client.remove_object(BUCKET_NAME, s3_key)
+            logger.info(f"Rolled back MinIO object: {s3_key}")
+            return True
+        except Exception as cleanup_err:
+            logger.error(f"Cleanup failed for {s3_key}: {cleanup_err}")
+            return False
 
     def UploadImage(self, request, context):
         image_id = str(uuid.uuid4())
@@ -141,15 +157,18 @@ class ImageIngestionService(image_ingestion_pb2_grpc.ImageIngestionServiceServic
         filename = request.filename or f"image_{image_id}.jpg"
         mime_type = request.mime_type or "image/jpeg"
         uploaded_at = datetime.utcnow().isoformat()
-        
-        # Get camera metadata
+
         camera_id = request.camera_id or "CAM-UNKNOWN"
         capture_timestamp = request.capture_timestamp or uploaded_at
-        
-        logger.info(f"Received upload request from {camera_id} for image: {filename} (Size: {len(request.image_data)} bytes)")
+
+        logger.info(
+            f"Received upload request from {camera_id} for image: {filename} "
+            f"(Size: {len(request.image_data)} bytes)"
+        )
 
         # 1. Upload to MinIO
         s3_key = f"uploads/{datetime.utcnow().strftime('%Y/%m/%d')}/{image_id}_{filename}"
+        s3_uri = None
         try:
             data_stream = io.BytesIO(request.image_data)
             self.minio_client.put_object(
@@ -170,7 +189,7 @@ class ImageIngestionService(image_ingestion_pb2_grpc.ImageIngestionServiceServic
                 message=f"Failed to upload image to S3: {str(e)}"
             )
 
-        # 2. Push event metadata to RabbitMQ
+        # 2. Push event metadata to RabbitMQ (rollback MinIO if publish fails)
         event_payload = {
             "event_id": event_id,
             "image_id": image_id,
@@ -191,21 +210,15 @@ class ImageIngestionService(image_ingestion_pb2_grpc.ImageIngestionServiceServic
             logger.info(f"Published ingestion event to RabbitMQ for image: {image_id}")
         except Exception as e:
             logger.error(f"Failed to publish event to RabbitMQ for image {image_id}: {e}")
-            # Bù trừ: xóa ảnh mồ côi để MinIO và RabbitMQ luôn nhất quán
-            try:
-                self.minio_client.remove_object(BUCKET_NAME, s3_key)
-                logger.info(f"Rolled back MinIO object: {s3_key}")
-            except Exception as cleanup_err:
-                logger.error(f"Cleanup failed for {s3_key}: {cleanup_err}")
+            self._rollback_minio_object(s3_key)
             context.set_code(grpc.StatusCode.UNAVAILABLE)
             context.set_details(f"RabbitMQ Publish Error: {str(e)}")
             return image_ingestion_pb2.ImageUploadResponse(
                 status="FAILED",
-                message="Queue unavailable, please retry."
+                message="Queue unavailable, image rolled back from MinIO. Please retry."
             )
-            
 
-        # 3. Return response
+        # 3. Return response only after BOTH MinIO + RabbitMQ succeeded
         return image_ingestion_pb2.ImageUploadResponse(
             image_id=image_id,
             s3_uri=s3_uri,
