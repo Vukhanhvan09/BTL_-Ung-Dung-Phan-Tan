@@ -256,7 +256,7 @@ def process_partition(iterator, detection_mode):
 
             if detection_mode == "yolo":
                 # 2. Run real YOLOv8 object detection
-                results = model(img)
+                results = model(img, classes=[0, 2, 3, 5, 7])
 
                 # YOLO COCO class indices:
                 # 0: person (Pedestrian)
@@ -277,6 +277,30 @@ def process_partition(iterator, detection_mode):
                             vehicle_counts['Truck'] += 1
                         elif cls_id == 0:
                             vehicle_counts['Pedestrian'] += 1
+
+                # Save an annotated JPEG separately; never overwrite the raw frame.
+                # Stable object key allows the dashboard to find it without a DB migration.
+                # This is best-effort: a visualization upload failure must not lose
+                # valid vehicle counts or force the whole batch to be reprocessed.
+                try:
+                    from PIL import Image as AnnotatedImage
+                    overlay_rgb = results[0].plot()[:, :, ::-1]
+                    overlay_buffer = io.BytesIO()
+                    AnnotatedImage.fromarray(overlay_rgb).save(
+                        overlay_buffer, format="JPEG", quality=85
+                    )
+                    overlay_size = overlay_buffer.tell()
+                    overlay_buffer.seek(0)
+                    overlay_key = f"annotated/{Path(s3_key).with_suffix('')}_yolo.jpg"
+                    minio_client.put_object(
+                        bucket, overlay_key, overlay_buffer,
+                        length=overlay_size, content_type="image/jpeg"
+                    )
+                    logger.info("YOLO annotated frame saved: s3://%s/%s", bucket, overlay_key)
+                except Exception as overlay_exc:
+                    logger.warning(
+                        "Could not save annotated image for %s: %s", image_id, overlay_exc
+                    )
             else:
                 # 3. Fallback: High-fidelity Time-of-day Mock Detection
                 try:

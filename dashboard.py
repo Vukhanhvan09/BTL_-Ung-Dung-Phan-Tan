@@ -133,6 +133,38 @@ def load_minio_image(s3_uri):
         st.sidebar.error(f"Failed to fetch image from MinIO: {e}")
         return None
 
+
+# Cached frame retrieval for the video replay tab.
+@st.cache_data(ttl=120, max_entries=240, show_spinner=False)
+def load_video_frame_bytes(s3_uri):
+    if not isinstance(s3_uri, str) or not s3_uri.startswith("s3://"):
+        return None
+    try:
+        bucket, object_name = s3_uri[5:].split("/", 1)
+        client = Minio(MINIO_ENDPOINT, access_key=MINIO_ACCESS_KEY,
+                       secret_key=MINIO_SECRET_KEY, secure=False)
+        response = client.get_object(bucket, object_name)
+        try:
+            return response.read()
+        finally:
+            response.close()
+            response.release_conn()
+    except Exception:
+        return None
+
+
+def annotated_s3_uri(raw_s3_uri):
+    """Match spark_job_step5.py object naming without changing ClickHouse schema."""
+    if not isinstance(raw_s3_uri, str) or not raw_s3_uri.startswith("s3://"):
+        return None
+    try:
+        bucket, key = raw_s3_uri[5:].split("/", 1)
+        stem = key.rsplit(".", 1)[0]
+        return f"s3://{bucket}/annotated/{stem}_yolo.jpg"
+    except ValueError:
+        return None
+
+
 # Load Data from ClickHouse
 @st.cache_data(ttl=10) # Refresh data cache every 10 seconds
 def fetch_dashboard_data(detection_mode):
@@ -225,7 +257,13 @@ def fetch_dashboard_data(detection_mode):
                 f.camera_id AS camera_id,
                 c.location AS location,
                 any(f.congestion_level) AS congestion_level,
-                sumIf(f.count, f.vehicle_type_id IN (1, 2, 3, 4)) AS total_vehicles
+                sumIf(f.count, f.vehicle_type_id IN (1, 2, 3, 4)) AS total_vehicles,
+                sumIf(f.count, f.vehicle_type_id = 1) AS cars,
+                sumIf(f.count, f.vehicle_type_id = 2) AS motorcycles,
+                sumIf(f.count, f.vehicle_type_id = 3) AS buses,
+                sumIf(f.count, f.vehicle_type_id = 4) AS trucks,
+                sumIf(f.count, f.vehicle_type_id = 5) AS pedestrians,
+                max(f.inference_time_ms) AS inference_time_ms
             FROM (SELECT * FROM dim_images FINAL) AS img
             JOIN fact_traffic_flow AS f FINAL
                 ON img.image_id = f.image_id
@@ -351,7 +389,7 @@ else:
     st.markdown("<br>", unsafe_allow_html=True)
 
     # --- Tabbed Main Content ---
-    tab_dashboard, tab_map, tab_images = st.tabs(["📊 Thống Kê & Đồ Thị", "🗺️ Bản Đồ Giao Thông", "🖼️ Xem Ảnh Chi Tiết (MinIO API)"])
+    tab_dashboard, tab_map, tab_images, tab_video = st.tabs(["📊 Thống Kê & Đồ Thị", "🗺️ Bản Đồ Giao Thông", "🖼️ Xem Ảnh Chi Tiết (MinIO API)", "🎬 Giám Sát Video"])
 
     with tab_dashboard:
         # First row of graphs
@@ -501,25 +539,49 @@ else:
         st.markdown("Chọn một khung hình trong danh sách để xem ảnh chụp camera thực tế lưu trên MinIO S3 cùng với kết quả đếm xe chi tiết của Spark:")
         
         if not filtered_images.empty:
-            # Create a selection list
-            image_options = []
-            for _, r in filtered_images.iterrows():
-                # Formatter: Camera_ID - Location - Time (Vehicles: X, Congestion: Y)
-                label = f"{r['camera_id']} | {r['location']} | {r['captured_at'].strftime('%Y-%m-%d %H:%M:%S')} (Xe đếm được: {r['total_vehicles']}, Ùn tắc: {r['congestion_level']})"
-                image_options.append((label, r['s3_uri'], r['image_id'], r['camera_id'], r['location'], r['captured_at'], r['congestion_level']))
-                
-            selected_option = st.selectbox(
+            # Streamlit options must be scalar IDs, never pandas Series.
+            # Use a unique image ID to retrieve the complete frame record.
+            image_rows = filtered_images.drop_duplicates(subset=["image_id"]).copy()
+            image_rows["image_id"] = image_rows["image_id"].astype(str)
+            image_by_id = image_rows.set_index("image_id", drop=False)
+            image_options = image_rows["image_id"].tolist()
+
+            def format_image_option(image_id):
+                r = image_by_id.loc[image_id]
+                timestamp = pd.to_datetime(r["captured_at"])
+                return (
+                    f"{r['camera_id']} | {r['location']} | "
+                    f"{timestamp.strftime('%Y-%m-%d %H:%M:%S')} "
+                    f"(Xe đếm được: {r['total_vehicles']}, "
+                    f"Ùn tắc: {r['congestion_level']})"
+                )
+
+            selected_image_id = st.selectbox(
                 "Chọn khung hình muốn kiểm tra:",
                 options=image_options,
-                format_func=lambda x: x[0]
+                format_func=format_image_option,
+                key="selected_detail_image_id",
             )
-            
-            if selected_option:
-                _, s3_uri, image_id, cam_id, loc, captured_at, cong = selected_option
-                
+
+            if selected_image_id is not None:
+                frame_details = image_by_id.loc[selected_image_id]
+                image_id = selected_image_id
+                s3_uri = frame_details["s3_uri"]
+                cam_id = frame_details["camera_id"]
+                loc = frame_details["location"]
+                captured_at = pd.to_datetime(frame_details["captured_at"])
+                cong = frame_details["congestion_level"]
+
                 # Retrieve from MinIO
                 with st.spinner("🔄 Đang tải hình ảnh từ kho lưu trữ MinIO S3..."):
-                    img_file = load_minio_image(s3_uri)
+                    prefer_overlay = detection_mode == "yolo" and st.checkbox(
+                        "Hiển thị bounding box YOLOv8", value=True, key="image_detail_overlay"
+                    )
+                    display_uri = annotated_s3_uri(s3_uri) if prefer_overlay else s3_uri
+                    img_file = load_minio_image(display_uri) if display_uri else None
+                    if img_file is None and prefer_overlay:
+                        img_file = load_minio_image(s3_uri)
+                        st.caption("Frame này chưa có ảnh bounding box trong MinIO; đang hiển thị ảnh gốc.")
                     
                 img_col, details_col = st.columns([5, 3])
                 
@@ -543,6 +605,9 @@ else:
                     
                     st.markdown("---")
                     st.markdown("### 📋 Kết Quả Phân Tích Phương Tiện")
+                    st.metric("Tổng số phương tiện", int(frame_details["total_vehicles"]))
+                    st.metric("Thời gian xử lý frame", f'{int(frame_details["inference_time_ms"])} ms')
+                    st.caption("Thời gian này bao gồm tải/giải mã ảnh và suy luận trong Spark; không chỉ riêng model.predict().")
                     
                     # Fetch specific counts for this image
                     try:
@@ -565,6 +630,135 @@ else:
                         st.error(f"Lỗi truy vấn chi tiết phương tiện từ ClickHouse: {e}")
         else:
             st.info("Không có khung hình nào phù hợp với bộ lọc hiện tại.")
+
+
+    with tab_video:
+        st.markdown("### 🎬 Phát lại frame video từ MinIO")
+        st.caption("Đây là chuỗi frame đã được YOLOv8 xử lý và lưu trữ, không phải video trực tiếp. Mỗi camera có thể dùng một video nguồn riêng.")
+        video_frames = filtered_images[
+            filtered_images["filename"].astype(str).str.contains(r"_frame\d+\.jpg$", regex=True, case=False, na=False)
+        ].copy()
+        if detection_mode != "yolo":
+            st.info("Chọn 'YOLOv8 — nhận diện thật' trong thanh bên để xem frame video đã nhận diện.")
+        elif video_frames.empty:
+            st.info("Chưa có frame video phù hợp với camera đang chọn. Hãy gửi video từ client và đợi Spark xử lý.")
+        else:
+            # Filenames from video client follow:
+            # CAM-HN-001_YYYYMMDD_HHMMSS_microseconds_frame000001.jpg
+            # Group by recording/upload minute across all cameras, not by frame position
+            # across the entire history. This is a time-window filter, not a true run ID.
+            video_frames["session_minute"] = video_frames["filename"].astype(str).str.extract(
+                r"_((?:20\d{6})_\d{4})\d{2}_\d+_frame\d+\.jpg$",
+                expand=False,
+            )
+            video_frames["frame_number"] = pd.to_numeric(
+                video_frames["filename"].astype(str).str.extract(
+                    r"_frame(\d+)\.jpg$", expand=False
+                ), errors="coerce"
+            )
+            session_minutes = sorted(video_frames["session_minute"].dropna().unique().tolist(), reverse=True)
+            if not session_minutes:
+                st.warning("Không tìm thấy mã thời gian phiên trong tên frame. Hãy kiểm tra quy tắc đặt tên của ingestion/client.py.")
+                st.stop()
+            selected_session = st.selectbox(
+                "Chọn phiên video (theo phút gửi frame)",
+                options=session_minutes,
+                format_func=lambda x: f"{x[:4]}-{x[4:6]}-{x[6:8]} {x[9:11]}:{x[11:13]} · {x}",
+                key="video_replay_session",
+            )
+            session_frames = video_frames[video_frames["session_minute"] == selected_session].copy()
+            session_frames = session_frames.sort_values(["camera_id", "frame_number", "captured_at", "filename"])
+            video_camera_ids = sorted(session_frames["camera_id"].astype(str).unique().tolist())
+            chosen_cameras = st.multiselect(
+                "Camera phát lại (tối đa 3)", video_camera_ids,
+                default=video_camera_ids[:3], max_selections=3,
+                key="video_replay_cameras",
+            )
+            fps = st.slider("Tốc độ phát lại (frame/giây)", 1, 3, 1, key="video_replay_fps")
+            show_overlay = st.checkbox(
+                "Hiển thị bounding box YOLOv8 trên video", value=True,
+                key="video_replay_overlay"
+            )
+            st.caption("Phiên được nhóm theo phút trong tên file. Nếu một lần gửi kéo dài qua hai phút, hãy chọn từng phút để xem; đây chưa phải mã phiên duy nhất.")
+            streams = {}
+            for camera_id in chosen_cameras:
+                camera_rows = session_frames[session_frames["camera_id"] == camera_id].tail(100)
+                streams[camera_id] = camera_rows.to_dict("records")
+            if streams:
+                st.caption("Số frame trong phiên: " + " · ".join(f"{cam}: {len(rows)}" for cam, rows in streams.items()))
+            max_frames = max((len(rows) for rows in streams.values()), default=0)
+            if max_frames:
+                # Reset the cursor when camera selection or dataset changes.
+                signature = (selected_session, tuple(chosen_cameras), tuple(
+                    (cam, len(rows), str(rows[-1]["image_id"])) for cam, rows in streams.items()
+                ))
+                if st.session_state.get("video_replay_signature") != signature:
+                    st.session_state.video_replay_signature = signature
+                    st.session_state.video_replay_index = 0
+                    st.session_state.video_replay_playing = False
+                st.session_state.video_replay_index = min(
+                    st.session_state.get("video_replay_index", 0), max_frames - 1
+                )
+                controls = st.columns([1, 1, 1, 3])
+                if controls[0].button("▶ Phát", key="video_play"):
+                    if st.session_state.video_replay_index >= max_frames - 1:
+                        st.session_state.video_replay_index = 0
+                    st.session_state.video_replay_playing = True
+                if controls[1].button("⏸ Dừng", key="video_pause"):
+                    st.session_state.video_replay_playing = False
+                if controls[2].button("↺ Đầu", key="video_reset"):
+                    st.session_state.video_replay_index = 0
+                    st.session_state.video_replay_playing = False
+                # Fragment refreshes only the replay, not the entire dashboard.
+                @st.fragment(run_every="1s")
+                def render_video_replay():
+                    idx = min(st.session_state.video_replay_index, max_frames - 1)
+                    st.progress((idx + 1) / max_frames,
+                                text=f"Frame {idx + 1}/{max_frames} · {'Đang phát' if st.session_state.video_replay_playing else 'Đang dừng'}")
+                    columns = st.columns(len(streams))
+                    for col, (camera_id, frames) in zip(columns, streams.items()):
+                        with col:
+                            st.markdown(f"**📹 {camera_id}**")
+                            if idx >= len(frames):
+                                st.info("Camera này đã hết frame.")
+                                continue
+                            frame = frames[idx]
+                            overlay_uri = annotated_s3_uri(frame["s3_uri"]) if show_overlay else None
+                            data = load_video_frame_bytes(overlay_uri) if overlay_uri else None
+                            overlay_found = data is not None
+                            if data is None:
+                                data = load_video_frame_bytes(frame["s3_uri"])
+                            if data:
+                                st.image(data, width="stretch")
+                                if show_overlay and not overlay_found:
+                                    st.caption("Ảnh gốc · chưa có bounding box cho frame này")
+                            else:
+                                st.warning("Không tải được frame từ MinIO.")
+                            st.caption(f"{frame['captured_at']} · {frame['filename']}")
+                            st.markdown(
+                                f"**Xe: {int(frame['total_vehicles'])}** · "
+                                f"**Ùn tắc: {frame['congestion_level']}** · "
+                                f"**Xử lý: {int(frame['inference_time_ms'])} ms**"
+                            )
+                            st.caption(
+                                f"🚗 Ô tô: {int(frame['cars'])}  |  "
+                                f"🏍️ Xe máy: {int(frame['motorcycles'])}  |  "
+                                f"🚌 Xe buýt: {int(frame['buses'])}  |  "
+                                f"🚚 Xe tải: {int(frame['trucks'])}  |  "
+                                f"🚶 Người đi bộ: {int(frame['pedestrians'])}"
+                            )
+                    if st.session_state.video_replay_playing:
+                        # At 1 FPS advance each tick. At higher FPS this advances
+                        # several frames per tick; the UI still refreshes once/second.
+                        next_idx = idx + fps
+                        if next_idx >= max_frames:
+                            st.session_state.video_replay_index = max_frames - 1
+                            st.session_state.video_replay_playing = False
+                        else:
+                            st.session_state.video_replay_index = next_idx
+                render_video_replay()
+            else:
+                st.info("Hãy chọn ít nhất một camera để phát lại.")
 
 # Automatic Refresh Button
 st.sidebar.markdown("---")

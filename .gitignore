@@ -42,3 +42,9 @@ Thumbs.db
 # Database backups
 backups/
 *.log
+
+# Local demo videos
+ingestion/sample_videos/
+
+# Temporary demo images
+demo_yolo_images/

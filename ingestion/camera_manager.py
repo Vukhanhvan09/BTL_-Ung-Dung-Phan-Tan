@@ -124,8 +124,11 @@ class CameraSimulatorManager:
     ):
         self.registry = registry or CameraRegistry.from_json()
         self.mode = (mode or os.getenv("CAMERA_MODE", "synthetic")).strip().lower()
-        if self.mode not in {"synthetic", "real"}:
-            raise ValueError("CAMERA_MODE must be synthetic or real")
+
+        if self.mode not in {"synthetic", "real", "video"}:
+            raise ValueError(
+                "CAMERA_MODE must be synthetic, real or video"
+            )
 
         limit_env = os.getenv("CAMERA_COUNT")
         if camera_limit is None and limit_env:
@@ -138,6 +141,22 @@ class CameraSimulatorManager:
         self._real_files = self._discover_real_images()
         self._real_cursor = 0
 
+        # Video input configuration
+        self.video_dir = Path(
+            os.getenv("VIDEO_DIR", "ingestion/sample_videos")
+        )
+
+        self.video_fps = float(os.getenv("VIDEO_FPS", "1"))
+        self.video_max_frames = int(
+            os.getenv("VIDEO_MAX_FRAMES", "10")
+        )
+
+        if self.mode == "video":
+            if self.video_fps <= 0:
+                raise ValueError("VIDEO_FPS must be greater than 0")
+
+            if self.video_max_frames <= 0:
+                raise ValueError("VIDEO_MAX_FRAMES must be greater than 0")
         logger.info(
             "CameraSimulatorManager mode=%s cameras=%d real_files=%d",
             self.mode,
@@ -187,13 +206,121 @@ class CameraSimulatorManager:
         mime = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
         return data, path.name, mime
 
+    def run_video_simulation(self, stub):
+        """Read and upload each camera's video in an independent worker thread."""
+        import cv2
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        camera_video_names = {
+            "CAM-HN-001": "traffic.mp4",
+            "CAM-HN-002": "17022934_4096_2160_60fps.mp4",
+            "CAM-HN-003": "17604987-hd_1920_1080_30fps.mp4",
+        }
+        assignments = []
+        for camera in self.cameras:
+            video_name = camera_video_names.get(camera.camera_id)
+            if video_name is None:
+                raise ValueError(
+                    f"No video mapping for camera {camera.camera_id}. "
+                    "Use CAMERA_COUNT=3 or add an explicit mapping."
+                )
+            video_path = self.video_dir / video_name
+            if not video_path.is_file():
+                raise FileNotFoundError(
+                    f"Video for {camera.camera_id} not found: {video_path}"
+                )
+            assignments.append((camera, video_path))
+            logger.info("VIDEO_MAPPING %s -> %s", camera.camera_id, video_path.name)
+
+        if not assignments:
+            logger.warning("No active cameras for video simulation")
+            return 0
+
+        def upload_camera_video(camera, video_path):
+            # Each worker owns its VideoCapture, counters and sampling clock.
+            cap = cv2.VideoCapture(str(video_path))
+            sent = 0
+            try:
+                if not cap.isOpened():
+                    logger.error("[%s] Cannot open video: %s", camera.camera_id, video_path)
+                    return 0
+                source_fps = cap.get(cv2.CAP_PROP_FPS)
+                if source_fps <= 0:
+                    logger.error("[%s] Invalid source FPS: %s", camera.camera_id, video_path)
+                    return 0
+                logger.info(
+                    "[%s] Reading video %s (source FPS=%.2f)",
+                    camera.camera_id, video_path.name, source_fps,
+                )
+                frame_index = 0
+                next_sample_time = 0.0
+                next_send_at = time.monotonic()
+
+                while sent < self.video_max_frames:
+                    success, frame = cap.read()
+                    if not success:
+                        logger.warning("[%s] End of video after %d uploads", camera.camera_id, sent)
+                        break
+                    video_time = frame_index / source_fps
+                    frame_index += 1
+                    if video_time + 1e-9 < next_sample_time:
+                        continue
+                    next_sample_time += 1.0 / self.video_fps
+
+                    encoded, buffer = cv2.imencode(".jpg", frame)
+                    if not encoded:
+                        logger.warning("[%s] Cannot encode frame %d", camera.camera_id, frame_index)
+                        continue
+
+                    # Pace uploads per camera; the three workers do not wait for each other.
+                    delay = next_send_at - time.monotonic()
+                    if delay > 0:
+                        time.sleep(delay)
+                    capture_time = datetime.now()
+                    filename = (
+                        f"{camera.camera_id}_"
+                        f"{capture_time.strftime('%Y%m%d_%H%M%S_%f')}_"
+                        f"frame{frame_index:06d}.jpg"
+                    )
+                    response = self._upload(
+                        stub, camera.camera_id, buffer.tobytes(), filename,
+                        "image/jpeg", capture_time.isoformat(),
+                    )
+                    if response is None or response.status != "SUCCESS":
+                        logger.error("[%s] Video upload failed; stopping this camera", camera.camera_id)
+                        break
+                    sent += 1
+                    next_send_at = max(next_send_at + 1.0 / self.video_fps, time.monotonic())
+            except Exception:
+                logger.exception("[%s] Unexpected video worker error", camera.camera_id)
+            finally:
+                cap.release()
+                logger.info("[%s] Video frames uploaded: %d", camera.camera_id, sent)
+            return sent
+
+        total = 0
+        with ThreadPoolExecutor(max_workers=len(assignments), thread_name_prefix="camera-video") as executor:
+            futures = {
+                executor.submit(upload_camera_video, camera, video_path): camera.camera_id
+                for camera, video_path in assignments
+            }
+            for future in as_completed(futures):
+                total += future.result()
+
+        logger.info(
+            "Video simulation complete: %d frames from %d cameras",
+            total, len(assignments),
+        )
+        return total
+
     def run_simulation(self, stub, frames_per_camera: int | None = None, sleep_s: float = 0.3):
         """Gửi frame từ N camera độc lập lên gRPC ingestion."""
         offsets_env = os.getenv("SIM_HOUR_OFFSETS", "0,1,2,3,5,8,12,14,16,18,20,22")
         default_offsets = [int(x.strip()) for x in offsets_env.split(",") if x.strip()]
         if frames_per_camera is None:
             frames_per_camera = int(os.getenv("FRAMES_PER_CAMERA", "2"))
-
+        if self.mode == "video":
+            return self.run_video_simulation(stub)
         # Round-robin across cameras for independent streams
         total = 0
         for round_idx in range(frames_per_camera):
